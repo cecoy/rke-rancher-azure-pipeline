@@ -1,0 +1,13 @@
+cloud_provider:
+  name: azure
+  azureCloudProvider:
+    aadClientId: SA_CLIENTID
+    aadClientSecret: SA_CLIENTSECRET
+    resourceGroup: RESOURCEGROUP
+    subscriptionId: SUBSCRIPTION
+    tenantId: SA_TENANTID
+    location: LOCATION
+    subnetName: CLUSTERNAMEsubnet
+    vnetName: CLUSTERNAMEvnet
+    securityGroupName: CLUSTERNAME
+    vmType: vmss

@@ -1,0 +1,18 @@
+services:
+  kube-api:
+    #pod_security_policy: false
+    ## Set true for Lab 
+    pod_security_policy: false
+    service_node_port_range: 30000-32767   
+network:
+  plugin: canal    
+ingress:
+  provider: nginx
+  options:
+    use-forwarded-headers: 'true'
+cluster_name: CLUSTERNAME
+authentication:
+  strategy: x509
+  sans:
+    - ELB
+    - HOSTNAME

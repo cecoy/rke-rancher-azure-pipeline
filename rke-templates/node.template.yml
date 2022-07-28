@@ -1,0 +1,6 @@
+    - address: PUB
+      internal_address: PRIV
+      hostname_override: NODEHOST
+      user: ubuntu
+      role: [controlplane, worker, etcd]
+      ssh_key_path: tmp/id_rsa

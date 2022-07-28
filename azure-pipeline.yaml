@@ -1,0 +1,694 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+variables:
+- group: connectionvariables
+- name: SUBSCRIPTION
+  value: '71024641-5eb4-48f5-ae6f-1bbf0cb51030'
+  RMLINK: 'Azure subscription 1 (71024641-5eb4-48f5-ae6f-1bbf0cb51030)'
+- name: RMLINK
+  value: 'Azure subscription 1 (71024641-5eb4-48f5-ae6f-1bbf0cb51030)'
+- name: DEPLOYMENTNAME
+  value: 'rke-rancher'
+- name: RESOURCEGROUP
+  value: 'rke-rancher'
+- name: HOSTNAME
+  value: 'rancher.simpleblocks.net'
+- name: LOCATION
+  value: 'eastus'
+- name: CLUSTERNAME
+  value: 'rancher'
+- name: NODECOUNT
+  value: 3
+- name: NODESIZE
+  value: 'Standard_DS2_v2'
+- name: RKEVERSION
+  value: 'v1.2.1'
+- name: RANCHERVERSION
+  value: 'v2.4.10'
+- name: NODEADMINUSER
+  value: 'ubuntu'
+- name: KEYVAULTNAME
+  value: 'rkevault2'
+- name: STORAGENAME
+  value: 'rkerancherst'
+- name: CONTAINERNAME
+  value: 'rketest'
+- name: CLOUDINIT
+  value: "I2Nsb3VkLWNvbmZpZwpwYWNrYWdlX3VwZ3JhZGU6IHRydWUKcGFja2FnZXM6CiAgLSBkb2NrZXIuaW8KcnVuY21kOgogIC0gdXNlcm1vZCAtYUcgZG9ja2VyIHVidW50dQ=="
+- name: RESTORE
+  value: ''
+- name: FORCEBACKUP
+  value: ''
+- name: SA_CLIENTID
+  value: fc8142e4-387f-47d3-aed2-a3f94efdf330
+- name: SA_CLIENTSECRET
+  value: j8z.puG3IUKAhuHHeazE4IsBDEXabvkWmL
+- name: SA_TENANTID
+  value: 1ba796d5-5e1d-48d7-a117-c2df338d8f95
+stages:
+ - stage: Infrastructure
+   jobs:
+   - job: Check
+     cancelTimeoutInMinutes: 1
+     continueOnError: true
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: AzureCLI@1
+       displayName: Validate
+       name: Validate
+       timeoutInMinutes: 10
+       continueOnError: true
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           az vmss wait --updated -g $(RESOURCEGROUP) -n $(CLUSTERNAME)
+           status=$?
+           if [ $status -eq 0 ]
+           then
+             az vmss list-instances -n $(CLUSTERNAME) -g $(RESOURCEGROUP) --query "[].id" --output tsv | \
+             az vmss run-command invoke --scripts 'until docker ps; do echo "."; sleep 5; done' \
+             --command-id RunShellScript --ids @-  
+             status=$?
+           fi
+           if [ $status -eq 0 ]
+           then
+             echo 'Infra Exists.'
+           else
+             echo '##vso[task.setvariable variable=Deploy;isOutput=true]true';
+             exit 1;
+           fi
+   - job: Deploy
+     cancelTimeoutInMinutes: 1
+     dependsOn: Check
+     condition: eq(dependencies.Check.outputs['Validate.Deploy'],true)
+     continueOnError: false
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: AzureResourceManagerTemplateDeployment@3
+       displayName: Deploy Cluster Security Group
+       inputs: 
+         deploymentScope: 'Resource Group'
+         azureResourceManagerConnection: $(RMLINK)
+         subscriptionId: $(SUBSCRIPTION)
+         action: 'Create Or Update Resource Group'
+         resourceGroupName: $(RESOURCEGROUP)
+         location: $(LOCATION)
+         csmFile: 'azure/azure-securitygroup.json'
+         overrideParameters: '-location "$(LOCATION)" -clusterName "$(CLUSTERNAME)"'
+         csmParametersFile: 'azure/azure-securitygroup.parameters.json'
+         deploymentMode: 'Incremental'
+         deploymentName: '$(DEPLOYMENTNAME)-sg'
+     - task: AzureResourceManagerTemplateDeployment@3
+       displayName: Deploy Cluster Resources
+       inputs: 
+         deploymentScope: 'Resource Group'
+         azureResourceManagerConnection: $(RMLINK)
+         subscriptionId: $(SUBSCRIPTION)
+         action: 'Create Or Update Resource Group'
+         resourceGroupName: $(RESOURCEGROUP)
+         location: $(LOCATION)
+         csmFile: 'azure/azure-cluster.json'
+         csmParametersFile: 'azure/azure-cluster.parameters.json'
+         overrideParameters: '-vmssName $(CLUSTERNAME) -location "$(LOCATION)" -dnsZonesName "$(HOSTNAME)" -adminPasswordOrKey "$(SSHPUBKEY)" -instanceCount "$(NODECOUNT)" -vmSku "$(NODESIZE)" -adminUsername "$(NODEADMINUSER)" -cloudInit $(CLOUDINIT)'
+         deploymentMode: 'Incremental'
+         deploymentName: '$(DEPLOYMENTNAME)'
+         deploymentOutputs: NODECONN
+     - task: AzureCLI@2
+       displayName: Parse and Save Output Node Info
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           NODESPUB=`echo -n $NODECONN | jq -r ".nodespub.value[]"`
+           NODESPRIV=`echo -n $NODECONN | jq -r ".nodespriv.value[]"`
+           NODESHOST=`echo -n $NODECONN | jq -r ".nodeshost.value[]"`
+           LBIPVAL=`echo -n $NODECONN | jq -r ".lbip.value"`
+           echo "$LBIPVAL"
+           echo "$NODESPUB"
+           echo "$NODESPRIV"
+           echo "$NODESHOST"
+           echo "$NODECONN"
+           az keyvault secret set --name "NODESPUB" --value "$NODESPUB" --vault-name "$KEYVAULTNAME"
+           az keyvault secret set --name "NODESPRIV" --value "$NODESPRIV" --vault-name "$KEYVAULTNAME"
+           az keyvault secret set --name "NODESHOST" --value "$NODESHOST" --vault-name "$KEYVAULTNAME"
+           az keyvault secret set --name "LBIP" --value "$LBIPVAL" --vault-name "$KEYVAULTNAME"
+     - task: AzureCLI@1
+       displayName: Validate
+       timeoutInMinutes: 10
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           az vmss wait --updated -g $(RESOURCEGROUP) -n $(CLUSTERNAME)
+           az vmss list-instances -n $(CLUSTERNAME) -g $(RESOURCEGROUP) --query "[].id" --output tsv | \
+           az vmss run-command invoke --scripts 'until docker ps; do echo "."; sleep 5; done' \
+           --command-id RunShellScript --ids @-
+           status=$?
+           if [ $status -eq 0 ]
+           then
+             echo "Validated."
+           else
+             exit 1;
+           fi
+ - stage: Kubernetes
+   dependsOn: Infrastructure
+   jobs:
+   - job: Check
+     continueOnError: true
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: AzureCLI@1
+       displayName: Validate
+       name: Validate
+       timeoutInMinutes: 10
+       continueOnError: true
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         DEPLOYCLUSTER: $(DEPLOYCLUSTER)
+         inlineScript: |
+           export STATEEXISTS=`az storage blob exists --container-name $(CONTAINERNAME) --name "cluster.rkestate" --account-name $(STORAGENAME) -o tsv --account-key $(STORAGEKEY)`
+           if [ $STATEEXISTS == "True" ]
+           then 
+             exit 0;
+           else
+             echo '##vso[task.setvariable variable=Deploy;isOutput=true]true';
+             exit 1;
+           fi         
+   - job: Deploy
+     dependsOn: Check
+     condition: or(eq(dependencies.Check.outputs['Validate.Deploy'],true),ne(variables.RESTORE, ''))
+     cancelTimeoutInMinutes: 1
+     continueOnError: false
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: AzureCLI@1
+       condition: eq(variables.RESTORE, '')
+       displayName: Download Existing RKE Statefile
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           sudo apt-get install ccrypt
+           export STATEEXISTS=`az storage blob exists --container-name $(CONTAINERNAME) --name "cluster.rkestate" --account-name $(STORAGENAME) -o tsv --account-key $(STORAGEKEY)`
+           if [ $STATEEXISTS == "True" ]
+           then 
+            az storage blob download --container-name $(CONTAINERNAME) --file 'cluster.rkestate.cpt' --name "cluster.rkestate" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+            ccrypt -d --key "$(ENCKEY)" cluster.rkestate.cpt
+           fi
+     - task: AzureCLI@2
+       displayName: Write Existing Kubeconfig File
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ "$(KUBECONFIG)" != '*' ]
+           then
+           mkdir ~/.kube
+           echo '$(KUBECONFIG)' | base64 --decode >> ~/.kube/config
+           chmod 600 ~/.kube/config
+           echo "Wrote KUBECONFIG"
+           cp ~/.kube/config kube_config_cluster.yml
+           fi
+     - task: AzureCLI@2
+       displayName: Write Security Keys
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           mkdir tmp     
+           if [ "$(SSHKEY)" != '*' ]
+           then
+           echo "$(SSHKEY)" | base64 --decode >> tmp/id_rsa
+           chmod 600 tmp/id_rsa
+           echo "Wrote SSH KEY"
+           fi   
+           if [ "$(SSHPUBKEY)" != '*' ]
+           then
+           echo "$(SSHPUBKEY)" >> tmp/id_rsa.pub
+           chmod 600 tmp/id_rsa.pub
+           echo "Wrote SSH PUB KEY"
+           fi    
+     - task: AzureCLI@2
+       displayName: Write Cluster Yaml
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           PRIVIPS=($(NODESPRIV))
+           PUBIPS=($(NODESPUB))
+           HOSTS=($(NODESHOST))
+           echo "nodes:" > cluster.yml
+           for ((i=0;i<NODECOUNT;i++)); do
+             PRIVIP=${PRIVIPS[$i]}
+             PUBIP=${PUBIPS[$i]}
+             NODEHOST=${HOSTS[$i]}
+             sed "s/PRIV/$PRIVIP/g; s/PUB/$PUBIP/g; s/NODEHOST/$NODEHOST/g;" rke-templates/node.template.yml >> cluster.yml
+           done
+           sed "s/CLUSTERNAME/$(CLUSTERNAME)/g; s/ELB/$(LBIP)/g; s/HOSTNAME/$HOSTNAME/g;" rke-templates/rke-features.template.yml >> cluster.yml
+           sed "s/SA_CLIENTID/$(SA_CLIENTID)/g; s/SA_CLIENTSECRET/$(SA_CLIENTSECRET)/g; s/RESOURCEGROUP/$RESOURCEGROUP/g; s/SUBSCRIPTION/$SUBSCRIPTION/g; s/SA_TENANTID/$SA_TENANTID/g; s/LOCATION/$LOCATION/g; s/CLUSTERNAME/$CLUSTERNAME/g;" rke-templates/cloud-provider.template.yml >> cluster.yml
+           cat cluster.yml
+     - task: Bash@3
+       displayName: RKE Download Binary
+       inputs:
+         targetType: 'inline'
+         script: |
+           wget https://github.com/rancher/rke/releases/download/$(RKEVERSION)/rke_linux-amd64 
+           mv rke_linux-amd64 rke
+           chmod +x rke
+         noProfile: false
+         noRc: false
+     - task: Bash@3
+       displayName: Build RKE Cluster
+       inputs:
+         targetType: 'inline'
+         script: |
+           ./rke up --config cluster.yml
+         noProfile: false
+         noRc: false
+     - task: AzureCLI@1
+       condition: ne(variables.RESTORE, '')
+       displayName: Download Existing RKE Statefile
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           sudo apt-get install ccrypt
+           export STATEEXISTS=`az storage blob exists --container-name $(CONTAINERNAME) --name "cluster.rkestate" --account-name $(STORAGENAME) -o tsv --account-key $(STORAGEKEY)`
+           if [ $STATEEXISTS == "True" ]
+           then 
+            az storage blob download --container-name $(CONTAINERNAME) --file 'cluster.rkestate.cpt' --name "cluster.rkestate" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+            ccrypt -d --key "$(ENCKEY)" cluster.rkestate.cpt
+           fi
+     - task: AzureCLI@1
+       condition: ne(variables.RESTORE, '')
+       displayName: Download Existing Snapshot
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           export SNAPSHOTEXISTS=`az storage blob exists --container-name $(CONTAINERNAME) --name "pipeline-k8s-snap.zip" --account-name $(STORAGENAME) -o tsv --account-key $(STORAGEKEY)`
+           if [ $SNAPSHOTEXISTS == "True" ]
+           then 
+            az storage blob download --container-name $(CONTAINERNAME) --file 'pipeline-k8s-snap.zip' --name "pipeline-k8s-snap.zip" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+           fi  
+
+     - task: Bash@3
+       displayName: Restore Cluster
+       condition: ne(variables.RESTORE, '')
+       inputs:
+         targetType: 'inline'
+         script: |
+           PUBIPS=($(NODESPUB))
+           for ((i=0;i<NODECOUNT;i++)); do
+             PUBIPS=${PUBIPS[$i]}
+             scp -p -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa $(RESTORE).zip ubuntu@${PRIVIP}:/home/ubuntu/
+             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS} sudo mv /home/ubuntu/$(RESTORE).zip /opt/rke/etcd-snapshots/
+           done
+           ./rke etcd snapshot-restore --config cluster.yml --name $(RESTORE)
+         noProfile: false
+         noRc: false         
+     - task: AzureCLI@1
+       condition: true
+       displayName: 'Upload RKE State to Blobstorage'
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           ccrypt -e --key "$(ENCKEY)" cluster.rkestate
+           az storage blob upload --container-name $(CONTAINERNAME) --file 'cluster.rkestate.cpt' --name "cluster.rkestate" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+     - task: AzureCLI@2
+       displayName: Save Kubeconfig to Vault
+       condition: succeeded()
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           KUBECONFIG=`cat kube_config_cluster.yml | base64`
+           az keyvault secret set --name "KUBECONFIG" --value "$KUBECONFIG" --vault-name $(KEYVAULTNAME)
+           mkdir ~/.kube
+           cp kube_config_cluster.yml ~/.kube/config
+     - task: AzureCLI@2
+       displayName: Create RKE Backup
+       condition: and(succeeded(),eq(variables.RESTORE, ''))
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           ./rke etcd snapshot-save --config cluster.yml --name pipeline-k8s-snap
+     - task: AzureCLI@1
+       condition: and(succeeded(),eq(variables.RESTORE, ''))
+       displayName: 'Upload RKE Snapshot to Blobstorage'
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           PUBIPS=($(NODESPUB))
+           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]} sudo chmod 744 /opt/rke/etcd-snapshots/pipeline-k8s-snap.zip
+           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]}:/opt/rke/etcd-snapshots/pipeline-k8s-snap.zip .
+           az storage blob upload --container-name $(CONTAINERNAME) --file 'pipeline-k8s-snap.zip' --name "pipeline-k8s-snap.zip" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+ - stage: Rancher
+   dependsOn: Kubernetes
+   condition: and(succeeded(),eq(variables.RESTORE, ''))
+   jobs:
+   - job: Check
+     continueOnError: true
+     steps:  
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: KubectlInstaller@0
+       displayName: Kubectl installer
+       inputs: 
+         kubectlVersion: latest
+     - task: HelmInstaller@1
+       displayName: Helm installer
+       inputs:
+         helmVersionToInstall: 'latest'
+     - task: AzureCLI@2
+       displayName: Write Existing Kubeconfig File
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ "$(KUBECONFIG)" != '*' ]
+           then
+           mkdir ~/.kube
+           echo '$(KUBECONFIG)' | base64 --decode >> ~/.kube/config
+           chmod 600 ~/.kube/config
+           echo "Wrote KUBECONFIG"
+           fi      
+     - task: AzureCLI@2
+       continueOnError: true
+       displayName: Validate
+       name: Validate
+       timeoutInMinutes: 10
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |        
+           helm status rancher -n cattle-system  > test.txt
+           status=$?
+           if [ $status -eq 0 ]
+           then
+             echo "Validated."
+           else
+             echo '##vso[task.setvariable variable=Deploy;isOutput=true]true'
+             echo "Deploying."
+             exit 1
+           fi
+   - job: Deploy
+     dependsOn: Check
+     condition: eq(dependencies.Check.outputs['Validate.Deploy'],true)
+     cancelTimeoutInMinutes: 1
+     continueOnError: false
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: KubectlInstaller@0
+       displayName: Kubectl installer
+       inputs: 
+         kubectlVersion: latest
+     - task: HelmInstaller@1
+       displayName: Helm installer
+       inputs:
+         helmVersionToInstall: 'latest'
+     - task: AzureCLI@2
+       displayName: Write Existing Kubeconfig File
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ "$(KUBECONFIG)" != '*' ]
+           then
+           mkdir ~/.kube
+           echo '$(KUBECONFIG)' | base64 --decode >> ~/.kube/config
+           chmod 600 ~/.kube/config
+           echo "Wrote KUBECONFIG"
+           cp ~/.kube/config kube_config_cluster.yml
+           fi      
+     - task: AzureCLI@2
+       displayName: Write Cert File From ENV
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ "$(CRT)" != '*' ]
+           then
+           az keyvault secret download --name "CRT" --vault-name "$(KEYVAULTNAME)" --file "tls.base64"
+           cat tls.base64 | base64 --decode > tls.pfx
+           echo "Fetched PFX Cert"
+           fi  
+           if [ -f "tls.pfx" ]
+           then
+           openssl pkcs12 -in tls.pfx -passin pass:'' -nocerts -nodes | sed -ne '/-BEGIN PRIVATE KEY-/,/-END PRIVATE KEY-/p' > tls.key
+           openssl pkcs12 -in tls.pfx -passin pass:'' -chain -nokeys | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > tls.crt
+           echo "Wrote Certs"
+           fi       
+     - task: Bash@3
+       displayName: Install Rancher
+       inputs:
+         targetType: 'inline'
+         script: |
+           helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+           helm repo update
+           helm upgrade --install rancher rancher-stable/rancher \
+           --version $(RANCHERVERSION) \
+           --namespace cattle-system \
+           --set hostname=$(HOSTNAME) \
+           --set ingress.tls.source=secret \
+           --create-namespace \
+           --wait
+         noProfile: false
+         noRc: false  
+     - task: AzureCLI@2
+       displayName: Install Certificate
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ -f "tls.key" ]
+           then
+           kubectl -n cattle-system create secret tls tls-rancher-ingress \
+           --cert=tls.crt \
+           --key=tls.key \
+           --dry-run -o yaml | \
+           kubectl apply -f - 
+           echo "Default Certificate Installed\Updated"
+           fi
+     - task: AzureCLI@2
+       displayName: Clean Up Certs
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           rm tls.*
+           echo "Keys and Certs Deleted"
+     - task: AzureCLI@2
+       displayName: Write Security Keys
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           mkdir tmp     
+           if [ "$(SSHKEY)" != '*' ]
+           then
+           echo "$(SSHKEY)" | base64 --decode >> tmp/id_rsa
+           chmod 600 tmp/id_rsa
+           echo "Wrote SSH KEY"
+           fi   
+           if [ "$(SSHPUBKEY)" != '*' ]
+           then
+           echo "$(SSHPUBKEY)" >> tmp/id_rsa.pub
+           chmod 600 tmp/id_rsa.pub
+           echo "Wrote SSH PUB KEY"
+           fi           
+     - task: AzureCLI@2
+       displayName: Write Cluster Yaml
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           PRIVIPS=($(NODESPRIV))
+           PUBIPS=($(NODESPUB))
+           HOSTS=($(NODESHOST))
+           echo "nodes:" > cluster.yml
+           for ((i=0;i<NODECOUNT;i++)); do
+             PRIVIP=${PRIVIPS[$i]}
+             PUBIP=${PUBIPS[$i]}
+             NODEHOST=${HOSTS[$i]}
+             sed "s/PRIV/$PRIVIP/g; s/PUB/$PUBIP/g; s/NODEHOST/$NODEHOST/g;" rke-templates/node.template.yml >> cluster.yml
+           done
+           sed "s/CLUSTERNAME/$(CLUSTERNAME)/g; s/ELB/$(LBIP)/g; s/HOSTNAME/$HOSTNAME/g;" rke-templates/rke-features.template.yml >> cluster.yml
+           sed "s/SA_CLIENTID/$(SA_CLIENTID)/g; s/SA_CLIENTSECRET/$(SA_CLIENTSECRET)/g; s/RESOURCEGROUP/$RESOURCEGROUP/g; s/SUBSCRIPTION/$SUBSCRIPTION/g; s/SA_TENANTID/$SA_TENANTID/g; s/LOCATION/$LOCATION/g; s/CLUSTERNAME/$CLUSTERNAME/g;" rke-templates/cloud-provider.template.yml >> cluster.yml
+           cat cluster.yml
+     - task: Bash@3
+       displayName: RKE Download Binary
+       inputs:
+         targetType: 'inline'
+         script: |
+           wget https://github.com/rancher/rke/releases/download/$(RKEVERSION)/rke_linux-amd64 
+           mv rke_linux-amd64 rke
+           chmod +x rke
+         noProfile: false
+         noRc: false
+     - task: AzureCLI@2
+       displayName: Create RKE Backup
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           ./rke etcd snapshot-save --config cluster.yml --name pipeline-svc-snap
+     - task: AzureCLI@1
+       displayName: 'Upload RKE Snapshot to Blobstorage'
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           PUBIPS=($(NODESPUB))
+           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]} sudo chmod 744 /opt/rke/etcd-snapshots/pipeline-svc-snap.zip
+           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]}:/opt/rke/etcd-snapshots/pipeline-svc-snap.zip .
+           az storage blob upload --container-name $(CONTAINERNAME) --file 'pipeline-svc-snap.zip' --name "pipeline-svc-snap.zip" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
+ - stage: Backup
+   condition: eq(variables.FORCEBACKUP, 'true')
+   jobs:
+   - job: Force
+     steps:
+     - task: AzureKeyVault@1
+       displayName: Load Key Vault ENV Variables
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         KeyVaultName: '$(KEYVAULTNAME)'
+         SecretsFilter: '*'
+         RunAsPreJob: true
+     - task: AzureCLI@2
+       displayName: Write Existing Kubeconfig File
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           if [ "$(KUBECONFIG)" != '*' ]
+           then
+           mkdir ~/.kube
+           echo '$(KUBECONFIG)' | base64 --decode >> ~/.kube/config
+           chmod 600 ~/.kube/config
+           echo "Wrote KUBECONFIG"
+           cp ~/.kube/config kube_config_cluster.yml
+           fi      
+     - task: AzureCLI@2
+       displayName: Write Security Keys
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           mkdir tmp     
+           if [ "$(SSHKEY)" != '*' ]
+           then
+           echo "$(SSHKEY)" | base64 --decode >> tmp/id_rsa
+           chmod 600 tmp/id_rsa
+           echo "Wrote SSH KEY"
+           fi   
+           if [ "$(SSHPUBKEY)" != '*' ]
+           then
+           echo "$(SSHPUBKEY)" >> tmp/id_rsa.pub
+           chmod 600 tmp/id_rsa.pub
+           echo "Wrote SSH PUB KEY"
+           fi           
+     - task: AzureCLI@2
+       displayName: Write Cluster Yaml
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           PRIVIPS=($(NODESPRIV))
+           PUBIPS=($(NODESPUB))
+           HOSTS=($(NODESHOST))
+           echo "nodes:" > cluster.yml
+           for ((i=0;i<NODECOUNT;i++)); do
+             PRIVIP=${PRIVIPS[$i]}
+             PUBIP=${PUBIPS[$i]}
+             NODEHOST=${HOSTS[$i]}
+             sed "s/PRIV/$PRIVIP/g; s/PUB/$PUBIP/g; s/NODEHOST/$NODEHOST/g;" rke-templates/node.template.yml >> cluster.yml
+           done
+           sed "s/CLUSTERNAME/$(CLUSTERNAME)/g; s/ELB/$(LBIP)/g; s/HOSTNAME/$HOSTNAME/g;" rke-templates/rke-features.template.yml >> cluster.yml
+           sed "s/SA_CLIENTID/$(SA_CLIENTID)/g; s/SA_CLIENTSECRET/$(SA_CLIENTSECRET)/g; s/RESOURCEGROUP/$RESOURCEGROUP/g; s/SUBSCRIPTION/$SUBSCRIPTION/g; s/SA_TENANTID/$SA_TENANTID/g; s/LOCATION/$LOCATION/g; s/CLUSTERNAME/$CLUSTERNAME/g;" rke-templates/cloud-provider.template.yml >> cluster.yml
+           cat cluster.yml
+     - task: Bash@3
+       displayName: RKE Download Binary
+       inputs:
+         targetType: 'inline'
+         script: |
+           wget https://github.com/rancher/rke/releases/download/$(RKEVERSION)/rke_linux-amd64 
+           mv rke_linux-amd64 rke
+           chmod +x rke
+         noProfile: false
+         noRc: false
+     - task: AzureCLI@2
+       displayName: Create RKE Backup
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptType: 'bash'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+           ./rke etcd snapshot-save --config cluster.yml --name pipeline-force-snap
+     - task: AzureCLI@1
+       displayName: 'Upload RKE Snapshot to Blobstorage'
+       inputs:
+         azureSubscription: '$(RMLINK)'
+         scriptLocation: inlineScript
+         inlineScript: |
+           PUBIPS=($(NODESPUB))
+           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]} sudo chmod 744 /opt/rke/etcd-snapshots/pipeline-force-snap.zip
+           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i tmp/id_rsa ubuntu@${PUBIPS[0]}:/opt/rke/etcd-snapshots/pipeline-force-snap.zip .
+           az storage blob upload --container-name $(CONTAINERNAME) --file 'pipeline-force-snap.zip' --name "pipeline-force-snap.zip" --account-name $(STORAGENAME) --account-key $(STORAGEKEY)
